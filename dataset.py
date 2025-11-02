@@ -87,6 +87,19 @@ class TimeSeriesDataset(Dataset):
         self.build_samples()
 
 
+    def get_embedding_per_cat(self):
+        """Get number of embeddings per categorical variable."""
+        if not self.categorical_features:
+            raise ValueError("No categorical features in dataset.")
+        
+        embed_per_cat = []
+        for cat in self.categorical_features:
+            n_unique = int(self.df[cat].nunique())
+            embed_per_cat.append(n_unique + 1) # +1 to handle for unknown category
+
+        return embed_per_cat
+
+
     def build_samples(self):
         # == Create samples and group data ==
         self.groups = {}          # Dictionary mapping id to group dataframe
@@ -111,6 +124,7 @@ class TimeSeriesDataset(Dataset):
         # Get the window of data
         enc_df = group.iloc[t - self.enc_len:t]
         dec_df = group.iloc[t:t + self.dec_len]
+        win_df = group.iloc[t - self.enc_len:t + self.dec_len]
 
         # Get static features only once
         if self.features.static_categorical:
@@ -129,43 +143,43 @@ class TimeSeriesDataset(Dataset):
         else:
             static_continuous = torch.zeros(0, dtype=torch.float32)
 
-        # Categorical features (known and observed) for encoder
-        enc_cat_cols = self.features.known_categorical + self.features.observed_categorical
-        if enc_cat_cols:
-            enc_temp_cats = torch.from_numpy(
-                enc_df[enc_cat_cols].to_numpy(dtype=np.int64)
+        # Categorical features observed
+        observed_cat_cols = self.features.observed_categorical
+        if observed_cat_cols:
+            obs_categorial = torch.from_numpy(
+                enc_df[observed_cat_cols].to_numpy(dtype=np.int64)
             )
         else:
-            enc_temp_cats = torch.zeros((self.enc_len, 0), dtype=torch.long)
+            obs_categorial = torch.zeros((self.enc_len, 0), dtype=torch.long)
 
-        # Categorical features (just known) for decoder
-        dec_cat_cols = self.features.known_categorical
-        if dec_cat_cols:
-            dec_temp_cats = torch.from_numpy(
-                dec_df[dec_cat_cols].to_numpy(dtype=np.int64)
-            )
+        # Continuous features observed
+        observed_cont_cols = self.features.observed_continuous
+        if len(observed_cont_cols) == 0:
+            cont_observed = torch.empty((self.enc_len, 0), dtype=torch.float32)
         else:
-            dec_temp_cats = torch.zeros((self.dec_len, 0), dtype=torch.long)
-
-        # Continuous features (known and observed) for encoder
-        enc_cont_cols = self.features.known_continuous + self.features.observed_continuous
-        if len(enc_cont_cols) == 0:
-            enc_temp_cont = torch.empty((self.enc_len, 0), dtype=torch.float32)
-        else:
-            enc_temp_cont = torch.tensor(
-                enc_df[enc_cont_cols].to_numpy(dtype=np.float32),
+            cont_observed = torch.tensor(
+                enc_df[observed_cont_cols].to_numpy(dtype=np.float32),
                 dtype=torch.float32
             )
 
-        # Continuous features (just known) for decoder
-        dec_cont_cols = self.features.known_continuous
-        if len(dec_cont_cols) == 0:
-            dec_temp_cont = torch.empty((self.dec_len, 0), dtype=torch.float32)
+        # Known categorical
+        known_cat_cols = self.features.known_categorical
+        if known_cat_cols:
+            known_categorial = torch.from_numpy(
+                win_df[known_cat_cols].to_numpy(dtype=np.int64)
+            )
         else:
-            dec_temp_cont = torch.tensor(
-                dec_df[dec_cont_cols].to_numpy(dtype=np.float32),
+            known_categorial = torch.zeros((self.time_steps, 0), dtype=torch.long)
+
+        # Known continuous
+        known_cont_cols = self.features.known_continuous
+        if known_cont_cols:
+            cont_known = torch.tensor(
+                win_df[known_cont_cols].to_numpy(dtype=np.float32),
                 dtype=torch.float32
             )
+        else:
+            cont_known = torch.empty((self.time_steps, 0), dtype=torch.float32)
 
         # Target values
         target = torch.tensor(
@@ -177,10 +191,10 @@ class TimeSeriesDataset(Dataset):
             "model_inputs": {
                 "static_cats": static_categorial,
                 "static_cont": static_continuous,
-                "enc_temp_cats": enc_temp_cats,
-                "enc_temp_cont": enc_temp_cont,
-                "dec_temp_cats": dec_temp_cats,
-                "dec_temp_cont": dec_temp_cont,
+                "obs_cats": obs_categorial,
+                "obs_cont": cont_observed,
+                "known_cats": known_categorial,
+                "known_cont": cont_known,
             },
             "target": target,
             "id": str(identifier),
@@ -231,7 +245,7 @@ if __name__ == "__main__":
         target="power_usage",
         known_continuous=["hour", "day", "day_of_week", "month", "days_from_start", "hours_from_start","t"],
         known_categorical=["categorical_hour", "categorical_day_of_week"],
-        static_categorical=[],
+        static_categorical=["categorical_id"],
         static_continuous=[],
         observed_continuous=[],
         observed_categorical=[],
@@ -282,5 +296,14 @@ if __name__ == "__main__":
 
     dl = DataLoader(train_dataset, batch_size=32, shuffle=True)
     batch = next(iter(dl))
+
+    params = {
+        "encoder_length": train_dataset.enc_len,
+        "decoder_length": train_dataset.dec_len,
+        "time_steps": train_dataset.time_steps,
+        "feature_description": feature_description,
+        "embed_per_cat": train_dataset.get_embedding_per_cat(),
+        "d_model": 64,
+    }
 
     print("Debug")
