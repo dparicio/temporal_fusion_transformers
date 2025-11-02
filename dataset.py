@@ -3,6 +3,7 @@ import pandas as pd
 import torch 
 from torch.utils.data import Dataset, DataLoader
 
+import os
 from dataclasses import dataclass
 from typing import List
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
@@ -237,7 +238,6 @@ class TimeSeriesDataset(Dataset):
 
 # Test code
 if __name__ == "__main__":
-    
     # Create feature description for electricity dataset
     feature_description = FeatureDescription(
         id="categorical_id",

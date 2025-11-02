@@ -4,9 +4,10 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from dataset import FeatureDescription, TimeSeriesDataset
-
+import matplotlib.pyplot as plt
 
 class GLU(nn.Module):
     """Gated Linear Unit (GLU)"""
@@ -66,7 +67,7 @@ class GRN(nn.Module):
         return (out, gate) if return_gate else out
     
 
-class MyModel(nn.Module):
+class TemporalFusionTransformer(nn.Module):
     def __init__(self, params):
         super().__init__()
         self.enc_len = params['encoder_length']
@@ -78,6 +79,8 @@ class MyModel(nn.Module):
         # Hidden state size (common across TFT)
         self.d_model = params['d_model']
         self.dropout = params['dropout']
+        self.n_head  = params['n_head']
+        self.quantiles = params['quantiles']
 
         # Input features
         self.static_categorical_inputs = len(self.feature_description.static_categorical)
@@ -165,9 +168,37 @@ class MyModel(nn.Module):
             dropout=0.0
         )
 
-        # Final LSTM gating and output layer (NOTE: no dropout)
+        # Local enhancement layer (GLU and LayerNorm)
         self.temporal_gate = GLU(input_size=self.d_model, hidden_size=self.d_model, dropout=self.dropout)
         self.temporal_ln   = nn.LayerNorm(self.d_model)
+
+        # Static enrichment GRN
+        self.static_enrichment_grn = GRN(
+            input_size=self.d_model,
+            hidden_size=self.d_model,
+            output_size=self.d_model,
+            dropout=self.dropout
+        )
+
+        # Temporal self-attention (attention, GLU and LayerNorm)
+        # Attention layer TODO: For now using pytorch implementation
+        self.attention = nn.MultiheadAttention(embed_dim=self.d_model, num_heads=self.n_head, dropout=self.dropout, batch_first=True)
+
+        self.attention_gate = GLU(input_size=self.d_model, hidden_size=self.d_model, dropout=self.dropout)
+        self.attention_ln   = nn.LayerNorm(self.d_model)
+
+        # Position-wise feedforward layer (GRN, GLU and LayerNorm)
+        self.positionwise_grn = GRN(
+            input_size=self.d_model,
+            hidden_size=self.d_model,
+            output_size=self.d_model,
+            dropout=self.dropout
+        )
+        self.positionwise_gate = GLU(input_size=self.d_model, hidden_size=self.d_model, dropout=self.dropout)
+        self.positionwise_ln   = nn.LayerNorm(self.d_model)
+
+        # Quantile output layers
+        self.quantile_fc = nn.Linear(self.d_model, len(self.quantiles))
 
     def input2embedding(
         self, 
@@ -313,6 +344,58 @@ class MyModel(nn.Module):
 
         lstm_layer = torch.cat([enc_out, dec_out], dim=1) 
         return lstm_layer
+    
+
+    def local_enhancement_layer(self, lstm_layer, input_embeddings):
+        # Pass through final gating layer
+        lstm_gated, _ = self.temporal_gate(lstm_layer)
+    
+        # Add and layer norm
+        temporal_feature_layer = self.temporal_ln(lstm_gated + input_embeddings)
+
+        return temporal_feature_layer
+
+
+    def static_enrichment_layer(self, temporal_features, static_context_enrichment):
+        # Expand static context to match temporal features shape
+        context = static_context_enrichment.unsqueeze(1).expand(-1, temporal_features.shape[1], -1)
+        # Apply static enrichment GRN
+        enriched_static_context = self.static_enrichment_grn(temporal_features, context=context)
+        return enriched_static_context
+    
+    
+    def get_attention_mask(self, x):
+        # Causal mask for attention
+        # Prevents the self-attention layer from looking into future tokens when predicting
+        mask = torch.triu(torch.ones(x.shape[1], x.shape[1], dtype=torch.bool, device=x.device), diagonal=1)
+        return mask
+    
+
+    def temporal_self_attention_layer(self, enriched_temporal_layer):
+        # Apply attention layer
+        mask = self.get_attention_mask(enriched_temporal_layer)
+        attention_output, _ = self.attention(enriched_temporal_layer, enriched_temporal_layer, enriched_temporal_layer, attn_mask=mask)
+
+        attention_gated, _ = self.attention_gate(attention_output)
+        attention_out = self.attention_ln(enriched_temporal_layer + attention_gated)
+
+        return attention_out
+
+
+    def positionwise_feedforward(self, temporal_feature_layer, attention_layer):
+        positionwise_out      = self.positionwise_grn(attention_layer)
+        positionwise_gated, _ = self.positionwise_gate(positionwise_out)
+        transformer_layer     = self.positionwise_ln(temporal_feature_layer + positionwise_gated)
+        return transformer_layer
+
+
+    def quantile_output(self, transformer_layer):
+        # Get decoder part
+        decoder_layer = transformer_layer[:, self.enc_len:, :]
+
+        # Apply quantile output layer (get predictions)
+        yhat = self.quantile_fc(decoder_layer)
+        return yhat
 
 
     def forward(self, batch):
@@ -364,22 +447,34 @@ class MyModel(nn.Module):
             static_context_state_h, 
             static_context_state_c
         )
-        # Pass through final gating layer
-        lstm_gated, _ = self.temporal_gate(lstm_layer)
-        
+
         # Create input embeddings for final gating layer
         input_embeddings = torch.cat([hist_features, fut_features], dim=1)
-        # Add and layer norm
-        temporal_feature_layer = self.temporal_ln(lstm_gated + input_embeddings)
-    
-        print("Debug")
+
+        # Apply local enhancement layer
+        temporal_feature_layer = self.local_enhancement_layer(lstm_layer, input_embeddings)
+
+        # Apply static enrichment layer
+        enriched_temporal_layer = self.static_enrichment_layer(temporal_feature_layer, static_context_enrichment)
+
+        # Apply temporal self-attention layer (attention + GLU + LayerNorm)
+        attention_layer = self.temporal_self_attention_layer(enriched_temporal_layer)
+
+        # Apply position-wise feedforward layer shape [B, T, H]
+        transformer_layer = self.positionwise_feedforward(temporal_feature_layer, attention_layer)
+
+        # Apply quantile output layer
+        yhat = self.quantile_output(transformer_layer)
+
+        return yhat
 
 
-        # _, (h, c) = self.enc(enc_in)                     # h,c: [num_layers, B, H]
-        # dec_out, _ = self.dec(dec_in, (h, c))            # [B, Td, H]
-        # yhat = self.head(dec_out)                        # [B, Td, 1]
-        return None
-
+def quantile_loss(y_true, y_pred, quantiles):
+    quantiles = torch.tensor(quantiles, dtype=y_pred.dtype, device=y_pred.device) if not torch.is_tensor(quantiles) else quantiles.to(y_pred.device, y_pred.dtype) 
+    errors = y_true - y_pred
+    q = quantiles.view(1, 1, -1)
+    loss = torch.maximum(q * errors, (q - 1) * errors)
+    return loss.mean()
 
 
 # Test code
@@ -441,8 +536,9 @@ if __name__ == "__main__":
     val_dataset.apply_scalers(real_scalers, target_scalers)
     test_dataset.apply_scalers(real_scalers, target_scalers)
 
-    dl = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    batch = next(iter(dl))
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=64, shuffle=False)
+    test_loader  = DataLoader(test_dataset,  batch_size=64, shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -455,24 +551,57 @@ if __name__ == "__main__":
         "embed_per_cat": train_dataset.get_embedding_per_cat(),
         "d_model": 64,
         "dropout": 0.1,
+        "n_head": 4,
+        "quantiles": [0.1, 0.5, 0.9],
     }
 
-    model = MyModel(params=params).to(device)
-
-    # move batch to device
-    for k, v in batch["model_inputs"].items():
-        if isinstance(v, torch.Tensor):
-            batch["model_inputs"][k] = v.to(device)
-    batch["target"] = batch["target"].to(device)
+    model = TemporalFusionTransformer(params=params).to(device)
 
     opt = optim.Adam(model.parameters(), lr=1e-3)
-    for step in range(500):
-        opt.zero_grad()
-        pred = model(batch)
-        loss = F.mse_loss(pred, batch["target"])
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        if (step+1) % 50 == 0:
-            print(f"step {step+1}: loss={loss.item():.6f}")
 
+    @torch.no_grad()
+    def run_epoch(model, loader, quantiles, device):
+        model.eval()
+        tot_loss, n = 0.0, 0
+        for batch in loader:
+            preds = model(batch)                                   # [B, Td, Q]
+            loss = quantile_loss(batch["target"], preds, quantiles)
+            bs = batch["target"].shape[0]
+            tot_loss += loss.item() * bs
+            n += bs
+        return tot_loss / max(n, 1)
+
+    EPOCHS = 1
+    train_hist, val_hist = [], []
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        running, nseen = 0.0, 0
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}", leave=False):
+            opt.zero_grad()
+            preds = model(batch)
+            loss = quantile_loss(batch["target"], preds, model.quantiles) 
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+            bs = batch["target"].shape[0]
+            running += loss.item() * bs
+            nseen += bs
+
+        train_loss = running / max(nseen, 1)
+        val_loss   = run_epoch(model, val_loader, model.quantiles, device)
+
+        train_hist.append(train_loss)
+        val_hist.append(val_loss)
+        print(f"Epoch {epoch:02d}: train={train_loss:.5f}  val={val_loss:.5f}")
+
+    plt.figure()
+    plt.plot(range(1, EPOCHS+1), train_hist, label="train")
+    plt.plot(range(1, EPOCHS+1), val_hist,   label="val")
+    plt.xlabel("Epoch")
+    plt.ylabel("Quantile (pinball) loss")
+    plt.title("Training vs Validation Loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
